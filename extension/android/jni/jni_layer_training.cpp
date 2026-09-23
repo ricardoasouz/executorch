@@ -60,6 +60,21 @@ class JEValue : public facebook::jni::JavaClass<JEValue> {
       facebook::jni::alias_ref<JEValue> JEValue);
 };
 
+namespace training_jni_compat {
+
+facebook::jni::local_ref<JTensor::javaobject> new_jtensor_from_tensor(
+    const executorch::aten::Tensor& tensor);
+
+TensorPtr new_tensor_from_jtensor(
+    facebook::jni::alias_ref<JTensor::javaobject> tensor);
+
+facebook::jni::local_ref<JEValue> new_jevalue_from_evalue(
+    runtime::EValue value);
+
+TensorPtr new_tensor_from_jevalue(facebook::jni::alias_ref<JEValue> value);
+
+} // namespace training_jni_compat
+
 class ExecuTorchTrainingJni
     : public facebook::jni::HybridClass<ExecuTorchTrainingJni> {
  private:
@@ -129,7 +144,8 @@ class ExecuTorchTrainingJni
       auto jevalue = jinputs->getElement(i);
       const auto typeCode = jevalue->getFieldValue(typeCodeField);
       if (typeCode == JEValue::kTypeCodeTensor) {
-        tensors.emplace_back(JEValue::JEValueToTensorImpl(jevalue));
+        tensors.emplace_back(
+            training_jni_compat::new_tensor_from_jevalue(jevalue));
         evalues.emplace_back(tensors.back());
       } else if (typeCode == JEValue::kTypeCodeInt) {
         static const auto toIntMethod =
@@ -160,7 +176,8 @@ class ExecuTorchTrainingJni
         facebook::jni::JArrayClass<JEValue>::newArray(result.get().size());
 
     for (int i = 0; i < result.get().size(); i++) {
-      auto jevalue = JEValue::newJEValueFromEValue(result.get()[i]);
+      auto jevalue =
+          training_jni_compat::new_jevalue_from_evalue(result.get()[i]);
       jresult->setElement(i, *jevalue);
     }
     return jresult;
@@ -183,7 +200,7 @@ class ExecuTorchTrainingJni
     for (auto& [layer, tensor] : result.get()) {
       parameters->put(
           facebook::jni::make_jstring(layer.data()),
-          JTensor::newJTensorFromTensor(tensor));
+          training_jni_compat::new_jtensor_from_tensor(tensor));
     }
     return parameters;
   }
@@ -205,7 +222,7 @@ class ExecuTorchTrainingJni
     for (auto& [layer, tensor] : result.get()) {
       gradients->put(
           facebook::jni::make_jstring(layer.data()),
-          JTensor::newJTensorFromTensor(tensor));
+          training_jni_compat::new_jtensor_from_tensor(tensor));
     }
     return gradients;
   }
@@ -269,7 +286,7 @@ class SGDHybrid : public facebook::jni::HybridClass<SGDHybrid> {
       auto value = iterator->second;
 
       std::string paramName = key->toStdString();
-      TensorPtr tensor = JTensor::newTensorFromJTensor(value);
+      TensorPtr tensor = training_jni_compat::new_tensor_from_jtensor(value);
 
       // Store the parameter name and tensor
       parameterNames_.push_back(paramName);
@@ -303,7 +320,7 @@ class SGDHybrid : public facebook::jni::HybridClass<SGDHybrid> {
       auto value = iterator->second;
 
       std::string gradName = key->toStdString();
-      TensorPtr tensor = JTensor::newTensorFromJTensor(value);
+      TensorPtr tensor = training_jni_compat::new_tensor_from_jtensor(value);
 
       // Store the gradient name and tensor
       gradientNames.push_back(gradName);

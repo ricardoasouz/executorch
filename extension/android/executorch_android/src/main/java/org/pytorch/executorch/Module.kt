@@ -8,11 +8,11 @@
 
 package org.pytorch.executorch
 
-import com.facebook.jni.HybridData
 import com.facebook.jni.annotations.DoNotStrip
 import com.facebook.soloader.nativeloader.NativeLoader
 import com.facebook.soloader.nativeloader.SystemDelegate
 import java.io.Closeable
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import org.pytorch.executorch.annotations.Experimental
 
@@ -30,20 +30,21 @@ private constructor(
     backendOptions: BackendOptionsMap?,
 ) : Closeable {
 
-  private val mHybridData: HybridData
+  private val mNativeHandle = AtomicLong(0L)
+  private val mCleanup = NativeHandleCleaner.register(this, mNativeHandle, MODULE_DESTRUCTOR)
   private val mMethodMetadata: Map<String, MethodMetadata>
 
-  /** Lock protecting the non-thread safe methods in mHybridData. */
+  /** Lock protecting the non-thread-safe native module. */
   private val mLock = ReentrantLock()
 
   init {
     ExecuTorchRuntime.getRuntime()
-    mHybridData =
+    val handle =
         if (backendOptions == null || backendOptions.isEmpty()) {
-          initHybrid(moduleAbsolutePath, loadMode, numThreads)
+          nativeCreate(moduleAbsolutePath, loadMode, numThreads)
         } else {
           val (backendNames, optionKeys, optionValues) = backendOptions.toJniArrays()
-          initHybridWithOptions(
+          nativeCreateWithOptions(
               moduleAbsolutePath,
               loadMode,
               numThreads,
@@ -52,16 +53,29 @@ private constructor(
               optionValues,
           )
         }
-    mMethodMetadata = populateMethodMeta()
+    check(handle != 0L) { "Failed to create native Module" }
+    mNativeHandle.set(handle)
+    try {
+      mMethodMetadata = populateMethodMeta(handle)
+    } catch (throwable: Throwable) {
+      mCleanup.clean()
+      throw throwable
+    }
   }
 
-  private fun populateMethodMeta(): Map<String, MethodMetadata> {
-    val methods = getMethodsNative()
+  private fun populateMethodMeta(handle: Long): Map<String, MethodMetadata> {
+    val methods = nativeGetMethods(handle)
     val metadata = HashMap<String, MethodMetadata>()
     for (name in methods) {
-      metadata[name] = MethodMetadata(name, getUsedBackends(name))
+      metadata[name] = MethodMetadata(name, nativeGetUsedBackends(handle, name))
     }
     return metadata
+  }
+
+  private fun requireNativeHandle(): Long {
+    val handle = mNativeHandle.get()
+    check(handle != 0L) { "Module has been destroyed" }
+    return handle
   }
 
   /**
@@ -84,15 +98,11 @@ private constructor(
   open fun execute(methodName: String, vararg inputs: EValue): Array<EValue> {
     mLock.lock()
     try {
-      check(mHybridData.isValid) { "Module has been destroyed" }
-      return executeNative(methodName, *inputs)
+      return nativeExecute(requireNativeHandle(), methodName, inputs)
     } finally {
       mLock.unlock()
     }
   }
-
-  @DoNotStrip
-  private external fun executeNative(methodName: String, vararg inputs: EValue): Array<EValue>
 
   /**
    * Load a method on this module. This might help with the first time inference performance,
@@ -104,8 +114,7 @@ private constructor(
   open fun loadMethod(methodName: String) {
     mLock.lock()
     try {
-      check(mHybridData.isValid) { "Module has been destroyed" }
-      val errorCode = loadMethodNative(methodName)
+      val errorCode = nativeLoadMethod(requireNativeHandle(), methodName)
       if (errorCode != 0) {
         throw ExecutorchRuntimeException.makeExecutorchException(
             errorCode,
@@ -117,16 +126,6 @@ private constructor(
     }
   }
 
-  @DoNotStrip private external fun loadMethodNative(methodName: String): Int
-
-  /**
-   * Returns the names of the backends in a certain method.
-   *
-   * @param methodName method name to query
-   * @return an array of backend name
-   */
-  @DoNotStrip private external fun getUsedBackends(methodName: String): Array<String>
-
   /**
    * Returns the names of methods.
    *
@@ -135,14 +134,11 @@ private constructor(
   open fun getMethods(): Array<String> {
     mLock.lock()
     try {
-      check(mHybridData.isValid) { "Module has been destroyed" }
-      return getMethodsNative()
+      return nativeGetMethods(requireNativeHandle())
     } finally {
       mLock.unlock()
     }
   }
-
-  @DoNotStrip private external fun getMethodsNative(): Array<String>
 
   /**
    * Get the corresponding [MethodMetadata] for a method
@@ -153,7 +149,7 @@ private constructor(
   open fun getMethodMetadata(name: String): MethodMetadata {
     mLock.lock()
     try {
-      check(mHybridData.isValid) { "Module has been destroyed" }
+      requireNativeHandle()
       return mMethodMetadata[name]
           ?: throw IllegalArgumentException("method $name does not exist for this module")
     } finally {
@@ -165,14 +161,11 @@ private constructor(
   open fun readLogBuffer(): Array<String>? {
     mLock.lock()
     try {
-      check(mHybridData.isValid) { "Module has been destroyed" }
-      return readLogBufferNative()
+      return nativeReadLogBuffer(requireNativeHandle())
     } finally {
       mLock.unlock()
     }
   }
-
-  @DoNotStrip private external fun readLogBufferNative(): Array<String>?
 
   /**
    * Dump the ExecuTorch ETRecord file to /data/local/tmp/result.etdump.
@@ -185,14 +178,11 @@ private constructor(
   open fun etdump(): Boolean {
     mLock.lock()
     try {
-      check(mHybridData.isValid) { "Module has been destroyed" }
-      return etdumpNative()
+      return nativeEtdump(requireNativeHandle())
     } finally {
       mLock.unlock()
     }
   }
-
-  @DoNotStrip private external fun etdumpNative(): Boolean
 
   /**
    * Dump the ExecuTorch ETDump file to [outputPath].
@@ -204,27 +194,21 @@ private constructor(
   open fun etdump(outputPath: String): Boolean {
     mLock.lock()
     try {
-      check(mHybridData.isValid) { "Module has been destroyed" }
-      return etdumpToNative(outputPath)
+      return nativeEtdumpTo(requireNativeHandle(), outputPath)
     } finally {
       mLock.unlock()
     }
   }
 
-  @DoNotStrip private external fun etdumpToNative(outputPath: String): Boolean
-
   /**
-   * Explicitly destroys the native Module object. Calling this method is not required, as the
-   * native object will be destroyed when this object is garbage-collected. However, the timing of
-   * garbage collection is not guaranteed, so proactively calling `destroy` can free memory more
-   * quickly. See [com.facebook.jni.HybridData.resetNative].
+   * Explicitly destroys the native Module object. The object is also released after this [Module]
+   * becomes unreachable, but calling this method is recommended because the timing of garbage
+   * collection is not guaranteed.
    */
   open fun destroy() {
     if (mLock.tryLock()) {
       try {
-        if (mHybridData.isValid) {
-          mHybridData.resetNative()
-        }
+        mCleanup.clean()
       } finally {
         mLock.unlock()
       }
@@ -238,6 +222,8 @@ private constructor(
   }
 
   companion object {
+    private val MODULE_DESTRUCTOR = NativeHandleCleaner.Destructor(::nativeDestroy)
+
     init {
       if (!NativeLoader.isInitialized()) {
         NativeLoader.init(SystemDelegate())
@@ -301,25 +287,58 @@ private constructor(
 
     @DoNotStrip
     @JvmStatic
-    private external fun initHybrid(
+    private external fun nativeCreate(
         moduleAbsolutePath: String,
         loadMode: Int,
         numThreads: Int,
-    ): HybridData
+    ): Long
 
     @DoNotStrip
     @JvmStatic
-    private external fun initHybridWithOptions(
+    private external fun nativeCreateWithOptions(
         moduleAbsolutePath: String,
         loadMode: Int,
         numThreads: Int,
         backendNames: Array<String>,
         optionKeys: Array<String>,
         optionValues: IntArray,
-    ): HybridData
+    ): Long
 
-    @DoNotStrip @JvmStatic fun readLogBufferStatic(): Array<String>? = readLogBufferStaticNative()
+    @DoNotStrip @JvmStatic private external fun nativeDestroy(nativeHandle: Long)
 
-    @DoNotStrip @JvmStatic private external fun readLogBufferStaticNative(): Array<String>?
+    @DoNotStrip
+    @JvmStatic
+    private external fun nativeExecute(
+        nativeHandle: Long,
+        methodName: String,
+        inputs: Array<out EValue>,
+    ): Array<EValue>
+
+    @DoNotStrip
+    @JvmStatic
+    private external fun nativeLoadMethod(nativeHandle: Long, methodName: String): Int
+
+    @DoNotStrip @JvmStatic private external fun nativeGetMethods(nativeHandle: Long): Array<String>
+
+    @DoNotStrip
+    @JvmStatic
+    private external fun nativeGetUsedBackends(
+        nativeHandle: Long,
+        methodName: String,
+    ): Array<String>
+
+    @DoNotStrip
+    @JvmStatic
+    private external fun nativeReadLogBuffer(nativeHandle: Long): Array<String>?
+
+    @DoNotStrip @JvmStatic private external fun nativeEtdump(nativeHandle: Long): Boolean
+
+    @DoNotStrip
+    @JvmStatic
+    private external fun nativeEtdumpTo(nativeHandle: Long, outputPath: String): Boolean
+
+    @DoNotStrip @JvmStatic fun readLogBufferStatic(): Array<String>? = nativeReadLogBufferStatic()
+
+    @DoNotStrip @JvmStatic private external fun nativeReadLogBufferStatic(): Array<String>?
   }
 }
